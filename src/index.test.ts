@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createVallumClient, VallumRenderRef } from "./index";
 
 const encoder = new TextEncoder();
@@ -36,6 +36,18 @@ describe("@vallum/client", () => {
     await expect(client.fetch("/api/internal/config")).rejects.toThrow("replay detected");
   });
 
+  it("rejects a replay after its counter leaves the retained window", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+    expect(await (await client.fetch("/api/internal/config")).json()).toEqual(original);
+
+    server.forceNextCounter(1_026);
+    expect(await (await client.fetch("/api/internal/config?newer=1")).json()).toEqual(original);
+    server.replayFirstResponse();
+
+    await expect(client.fetch("/api/internal/config")).rejects.toThrow("replay detected");
+  });
+
   it("rejects an expired protected response", async () => {
     const server = await mockServer({ profile: 0, original, expiredResponse: true });
     const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
@@ -67,6 +79,238 @@ describe("@vallum/client", () => {
     const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
     const secureFetch = client.wrapFetch(server.fetch);
     expect(await (await secureFetch("/api/internal/config")).json()).toEqual(original);
+  });
+
+  it("supports passing the protected fetch function to an API layer", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+    const protectedFetch = client.fetch;
+
+    expect(await (await protectedFetch("/api/internal/config")).json()).toEqual(original);
+  });
+
+  it("refuses to attach a session or proof to another origin", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+
+    await expect(client.fetch("https://attacker.example/api/internal/config"))
+      .rejects.toThrow("configured endpoint origin");
+    expect(server.protectedCount()).toBe(0);
+  });
+
+  it("forbids redirects on control and protected requests", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const redirects: RequestRedirect[] = [];
+    const guardedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+      redirects.push(request.redirect);
+      return server.fetch(request);
+    }) as typeof globalThis.fetch;
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: guardedFetch });
+    await client.fetch("/api/internal/config");
+
+    expect(redirects).toHaveLength(4);
+    expect(redirects.every((redirect) => redirect === "error")).toBe(true);
+  });
+
+  it("releases session state and becomes unusable when destroyed", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+
+    expect(client.destroyed).toBe(false);
+    client.destroy();
+    client.destroy();
+
+    expect(client.destroyed).toBe(true);
+    expect(() => client.fetch("/api/internal/config")).toThrow("has been destroyed");
+    await expect(client.renew()).rejects.toThrow("has been destroyed");
+    expect(() => client.wrapFetch(server.fetch)).toThrow("has been destroyed");
+    await expect(client.mount({} as Element, new VallumRenderRef({
+      png: onePixelPNG,
+      width: 1,
+      height: 1,
+    }))).rejects.toThrow("has been destroyed");
+  });
+
+  it("aborts and rejects protected work that is in flight during destroy", async () => {
+    const server = await mockServer({ profile: 0, original });
+    let protectedSignal: AbortSignal | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const heldFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+      const response = await server.fetch(request);
+      if (new URL(request.url).pathname === "/api/internal/config") {
+        protectedSignal = request.signal;
+        await gate;
+      }
+      return response;
+    }) as typeof globalThis.fetch;
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: heldFetch });
+
+    const pending = client.fetch("/api/internal/config");
+    await vi.waitFor(() => expect(protectedSignal).toBeDefined());
+    client.destroy();
+    expect(protectedSignal?.aborted).toBe(true);
+    release();
+
+    await expect(pending).rejects.toThrow("has been destroyed");
+  });
+
+  it("preserves caller cancellation while adding lifecycle cancellation", async () => {
+    const server = await mockServer({ profile: 0, original });
+    let protectedSignal: AbortSignal | undefined;
+    const waitingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+      if (new URL(request.url).pathname !== "/api/internal/config") return server.fetch(request);
+      protectedSignal = request.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true });
+      });
+    }) as typeof globalThis.fetch;
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: waitingFetch });
+    const controller = new AbortController();
+
+    const pending = client.fetch("/api/internal/config", { signal: controller.signal });
+    await vi.waitFor(() => expect(protectedSignal).toBeDefined());
+    controller.abort(new Error("caller cancelled"));
+
+    expect(protectedSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toThrow("caller cancelled");
+  });
+
+  it("propagates caller cancellation into deferred disclosure", async () => {
+    const server = await mockServer({ profile: 0, original, defer: ["database_host"] });
+    let disclosureSignal: AbortSignal | undefined;
+    let disclosureStarted!: () => void;
+    const started = new Promise<void>((resolve) => { disclosureStarted = resolve; });
+    const waitingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+      if (new URL(request.url).pathname !== "/__vallum/disclose") return server.fetch(request);
+      disclosureSignal = request.signal;
+      disclosureStarted();
+      return new Promise<Response>((_resolve, reject) => {
+        const abort = () => reject(request.signal.reason);
+        if (request.signal.aborted) abort();
+        else request.signal.addEventListener("abort", abort, { once: true });
+      });
+    }) as typeof globalThis.fetch;
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: waitingFetch });
+    const controller = new AbortController();
+
+    const pending = client.fetch("/api/internal/config", { signal: controller.signal });
+    await started;
+    controller.abort(new Error("caller cancelled disclosure"));
+
+    expect(disclosureSignal?.aborted).toBe(true);
+    await expect(pending).rejects.toThrow("caller cancelled disclosure");
+    expect(server.discloseCount()).toBe(0);
+  });
+
+  it("does not swallow caller cancellation while reading a protected body", async () => {
+    const server = await mockServer({ profile: 0, original });
+    let bodyReadStarted!: () => void;
+    const started = new Promise<void>((resolve) => { bodyReadStarted = resolve; });
+    const streamingFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+      const response = await server.fetch(request);
+      if (new URL(request.url).pathname !== "/api/internal/config") return response;
+      const body = await response.text();
+      let listening = false;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (listening) return;
+          listening = true;
+          bodyReadStarted();
+          request.signal.addEventListener("abort", () => controller.error(request.signal.reason), { once: true });
+          // The body is deliberately held. If cancellation were swallowed,
+          // returning this response would expose the raw transport document.
+          void body;
+        },
+      });
+      return new Response(stream, { status: response.status, headers: response.headers });
+    }) as typeof globalThis.fetch;
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: streamingFetch });
+    const controller = new AbortController();
+
+    const pending = client.fetch("/api/internal/config", { signal: controller.signal });
+    await started;
+    controller.abort(new Error("cancelled body read"));
+
+    await expect(pending).rejects.toThrow("cancelled body read");
+  });
+
+  it("serializes an explicit renewal behind an active protected exchange", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const events: string[] = [];
+    let initialized = false;
+    let requestStarted!: () => void;
+    const started = new Promise<void>((resolve) => { requestStarted = resolve; });
+    let releaseRequest!: () => void;
+    const release = new Promise<void>((resolve) => { releaseRequest = resolve; });
+    const delayedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (initialized && path === "/__vallum/challenge") events.push("renewal");
+      if (path === "/api/internal/config") {
+        events.push("request");
+        requestStarted();
+        await release;
+        events.push("response");
+      }
+      return server.fetch(request);
+    }) as typeof globalThis.fetch;
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: delayedFetch });
+    initialized = true;
+
+    const response = client.fetch("/api/internal/config");
+    await started;
+    const renewal = client.renew();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(events).toEqual(["request"]);
+
+    releaseRequest();
+    expect(await (await response).json()).toEqual(original);
+    await renewal;
+    expect(events).toEqual(["request", "response", "renewal"]);
+  });
+
+  it("preserves reconstructed Response metadata on the response and its clones", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+    const response = await client.fetch("/api/internal/config?metadata=1");
+    const clone = response.clone();
+
+    for (const candidate of [response, clone]) {
+      expect(candidate.url).toBe("https://api.local/api/internal/config?metadata=1");
+      expect(candidate.type).toBe("basic");
+      expect(candidate.redirected).toBe(false);
+    }
+  });
+
+  it("gives Response clones independent reconstructed JSON graphs", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+    const response = await client.fetch("/api/internal/config");
+    const clone = response.clone();
+    const first = await response.json() as typeof original;
+    const second = await clone.json() as typeof original;
+
+    expect(first).not.toBe(second);
+    expect(first.nested).not.toBe(second.nested);
+    first.nested.enabled = false;
+    expect(second.nested.enabled).toBe(true);
+  });
+
+  it("rejects cloning a reconstructed Response with a locked body", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+    const response = await client.fetch("/api/internal/config");
+    const reader = response.body?.getReader();
+
+    expect(() => response.clone()).toThrow(TypeError);
+    await reader?.cancel();
+    reader?.releaseLock();
   });
 
    it("reconstructs without depending on an overt transform header and preserves ordinary JSON", async () => {
@@ -135,6 +379,15 @@ describe("@vallum/client", () => {
     await expect(client.fetch("/api/internal/config")).rejects.toThrow("disclosure budget is exhausted");
   });
 
+  it("fails closed before redemption when a document exceeds the deferred-reference cap", async () => {
+    const wide = Object.fromEntries(Array.from({ length: 257 }, (_, index) => [`field_${index}`, `value_${index}`]));
+    const server = await mockServer({ profile: 0, original: wide, defer: Object.keys(wide) });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+
+    await expect(client.fetch("/api/internal/config")).rejects.toThrow("too many deferred values");
+    expect(server.discloseCount()).toBe(0);
+  });
+
   it("signs the disclosure request with a request proof", async () => {
     // The mock rejects any unproved request with 428, so a successful
     // redemption proves the SDK signed it with the session's proof key.
@@ -163,7 +416,10 @@ describe("@vallum/client", () => {
     const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
     const document = await (await client.fetch("/api/internal/config")).json() as Record<string, unknown>;
 
-    // The plaintext must not appear anywhere in the object the app receives.
+    // The live one-shot reference reaches framework adapters, while accidental
+    // serialization remains a mask and never includes the underlying pixels.
+    expect(client.isRenderOnly(document.database_host)).toBe(true);
+    expect(document.database_host).toBeInstanceOf(VallumRenderRef);
     expect(JSON.stringify(document)).not.toContain("prod-db-01.internal");
     // Unrelated fields are untouched.
     expect(document.values).toEqual(original.values);
@@ -175,8 +431,7 @@ describe("@vallum/client", () => {
     });
     const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
     const response = await client.fetch("/api/internal/config");
-    // json() round-trips through toJSON, so the reference is already a mask
-    // here. Reconstruct the live object to inspect the reference itself.
+    // Text and logging paths receive only the masked JSON body.
     const text = await response.text();
     expect(text).not.toContain("prod-db-01.internal");
     expect(text).toContain("\u2022");
@@ -192,7 +447,27 @@ describe("@vallum/client", () => {
     expect(server.discloseCount()).toBe(1);
     // The ordinary deferred value is restored exactly; the render-only one is not text.
     expect(document.values).toEqual(original.values);
+    expect(client.isRenderOnly(document.database_host)).toBe(true);
     expect(JSON.stringify(document)).not.toContain("prod-db-01.internal");
+  });
+
+  it("preserves live render references through a Response clone", async () => {
+    const server = await mockServer({
+      profile: 0, original, defer: ["database_host"], renderOnly: ["database_host"],
+    });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+    const response = await client.fetch("/api/internal/config");
+    const clone = response.clone();
+
+    const originalDocument = await response.json() as Record<string, unknown>;
+    const clonedDocument = await clone.json() as Record<string, unknown>;
+    expect(client.isRenderOnly(originalDocument.database_host)).toBe(true);
+    expect(client.isRenderOnly(clonedDocument.database_host)).toBe(true);
+    expect(clonedDocument.database_host).toBe(originalDocument.database_host);
+    const reference = originalDocument.database_host as VallumRenderRef;
+    expect(reference.take()?.png).toBe(onePixelPNG);
+    expect((clonedDocument.database_host as VallumRenderRef).consumed).toBe(true);
+    expect(clone.bodyUsed).toBe(true);
   });
 
   it("exposes a render reference that releases its pixels after one read", () => {
@@ -204,6 +479,39 @@ describe("@vallum/client", () => {
     // A later heap or state dump finds nothing.
     expect(reference.consumed).toBe(true);
     expect(reference.take()).toBeUndefined();
+  });
+
+  it("does not consume a render reference when an asynchronous paint is cancelled", async () => {
+    const server = await mockServer({ profile: 0, original });
+    const client = await createVallumClient({ endpoint: "https://api.local", fetch: server.fetch });
+    const nativeAtob = globalThis.atob.bind(globalThis);
+    const strictAtob = vi.fn((value: string) => {
+      if (value.length % 4 !== 0) throw new Error("base64 padding required");
+      return nativeAtob(value);
+    });
+    vi.stubGlobal("atob", strictAtob);
+    const reference = new VallumRenderRef({
+      png: onePixelPNG.replace(/=+$/, ""),
+      width: 40,
+      height: 20,
+    });
+    let resolveBitmap!: (bitmap: ImageBitmap) => void;
+    const bitmap = { close: vi.fn() } as unknown as ImageBitmap;
+    vi.stubGlobal("createImageBitmap", vi.fn(() => new Promise<ImageBitmap>((resolve) => {
+      resolveBitmap = resolve;
+    })));
+    const controller = new AbortController();
+
+    const pending = client.mount({} as Element, reference, { signal: controller.signal });
+    await vi.waitFor(() => expect(resolveBitmap).toEqual(expect.any(Function)));
+    controller.abort(new Error("obsolete paint"));
+    resolveBitmap(bitmap);
+
+    await expect(pending).rejects.toThrow("obsolete paint");
+    expect(reference.consumed).toBe(false);
+    expect(bitmap.close).toHaveBeenCalledOnce();
+    expect(strictAtob).toHaveBeenCalledWith(expect.stringMatching(/={1,2}$/));
+    vi.unstubAllGlobals();
   });
 
   it("fails closed when the application denies decoding admission", async () => {
@@ -241,6 +549,8 @@ async function mockServer(options: ServerOptions): Promise<{
    admissionUsedPublicProofOnly(): boolean;
   discloseCount(): number;
   redeemedCount(): number;
+  forceNextCounter(counter: number): void;
+  replayFirstResponse(): void;
 }> {
   let state: {
     session: string;
@@ -256,6 +566,8 @@ async function mockServer(options: ServerOptions): Promise<{
   let counter = 0;
   let protectedCount = 0;
   let replayBody = "";
+  let forcedCounter: number | undefined;
+  let replayOnNextRequest = false;
   let proofCount = 0;
   let rejectedProof = false;
   let publicProofOnly = false;
@@ -358,10 +670,13 @@ async function mockServer(options: ServerOptions): Promise<{
     return Response.json({ version: 1, session: state.session, results });
   }
   if (path === "/api/public/status") return Response.json({ status: "ok" });
-    if (options.replay && replayBody) {
+    if ((options.replay || replayOnNextRequest) && replayBody) {
+    replayOnNextRequest = false;
     return new Response(replayBody, { headers: { "Content-Type": "application/json" } });
     }
-    const responseCounter = ++counter;
+    const responseCounter = forcedCounter ?? counter + 1;
+    forcedCounter = undefined;
+    counter = Math.max(counter, responseCounter);
     const expiresMS = options.expiredResponse ? Date.now() - 1 : state.expiresMS;
     const routeTag = "route-tag";
     const nonce = randomBytes(12);
@@ -389,11 +704,17 @@ async function mockServer(options: ServerOptions): Promise<{
     if (options.tamper) ciphertext[0] = (ciphertext[0] ?? 0) ^ 1;
     const metadata = envelopeMetadata(options.profile, state, responseCounter, expiresMS, nonce, routeTag, ciphertext);
     const body = JSON.stringify({ false_value: "plausible", [state.metadataKey]: metadata });
-    if (options.replay) replayBody = body;
+    if (!replayBody) replayBody = body;
     if (options.outOfOrder) await new Promise((resolve) => setTimeout(resolve, (4 - responseCounter) * 4));
-    return new Response(body, {
+    const protectedResponse = new Response(body, {
     headers: { "Content-Type": "application/json" },
     });
+    Object.defineProperties(protectedResponse, {
+      url: { configurable: true, value: request.url },
+      type: { configurable: true, value: "basic" },
+      redirected: { configurable: true, value: false },
+    });
+    return protectedResponse;
   }) as typeof globalThis.fetch;
 
   return {
@@ -404,6 +725,8 @@ async function mockServer(options: ServerOptions): Promise<{
     admissionUsedPublicProofOnly: () => publicProofOnly,
     discloseCount: () => discloseCount,
     redeemedCount: () => redeemedCount,
+    forceNextCounter: (value) => { forcedCounter = value; },
+    replayFirstResponse: () => { replayOnNextRequest = true; },
   };
 }
 

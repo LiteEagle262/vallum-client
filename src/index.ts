@@ -12,6 +12,15 @@ export interface VallumClient {
   wrapFetch(implementation: typeof globalThis.fetch): typeof globalThis.fetch;
   renew(): Promise<void>;
   /**
+   * Releases this client's in-memory session and key references.
+   *
+   * Framework integrations call this when their provider is unmounted. A
+   * destroyed client cannot be renewed or used again.
+   */
+  destroy(): void;
+  /** True after `destroy()` has been called. */
+  readonly destroyed: boolean;
+  /**
    * Paints a render-only value into `element` as pixels.
    *
    * Render-only values never exist as a string in the browser, so they cannot
@@ -34,6 +43,8 @@ export interface MountOptions {
   accessibleLabel?: string;
   /** CSS pixel height. Defaults to the rendered height at device scale. */
   height?: number;
+  /** Cancels a pending paint before it consumes or commits the one-shot value. */
+  signal?: AbortSignal;
 }
 
 interface BootstrapResponse {
@@ -92,6 +103,9 @@ interface RenderPayload {
   height: number;
 }
 
+const inspectRenderReference = Symbol("inspect Vallum render reference");
+const consumeRenderReference = Symbol("consume Vallum render reference");
+
 /**
  * A protected value delivered as pixels rather than text.
  *
@@ -121,8 +135,83 @@ export class VallumRenderRef {
     return payload;
   }
 
+  /** @internal Reads pixels without consuming them while an async bitmap is prepared. */
+  [inspectRenderReference](): RenderPayload | undefined {
+    return this.#payload;
+  }
+
+  /** @internal Atomically consumes the payload used to prepare a completed paint. */
+  [consumeRenderReference](expected: RenderPayload): boolean {
+    if (this.#payload !== expected) return false;
+    this.#payload = undefined;
+    return true;
+  }
+
   toString(): string { return "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"; }
   toJSON(): string { return this.toString(); }
+}
+
+/**
+ * A normal Response whose direct `json()` call can return one-shot render
+ * references without serializing their pixel payload back through text.
+ *
+ * The actual body remains valid, masked JSON for logging, text readers, and
+ * clones that are not parsed through this class. Calling `json()` still
+ * consumes the body exactly once, matching the platform Response contract.
+ */
+class VallumReconstructedResponse extends Response {
+  readonly #document: unknown;
+  readonly #bodyText: string;
+  readonly #sourceURL: string;
+  readonly #sourceType: ResponseType;
+  readonly #sourceRedirected: boolean;
+
+  constructor(document: unknown, bodyText: string, init: ResponseInit, source: Response) {
+    super(bodyText, init);
+    this.#document = document;
+    this.#bodyText = bodyText;
+    this.#sourceURL = source.url;
+    this.#sourceType = source.type;
+    this.#sourceRedirected = source.redirected;
+  }
+
+  override get url(): string { return this.#sourceURL; }
+  override get type(): ResponseType { return this.#sourceType; }
+  override get redirected(): boolean { return this.#sourceRedirected; }
+
+  override async json(): Promise<any> {
+    await super.text();
+    return this.#document;
+  }
+
+  override clone(): VallumReconstructedResponse {
+    if (this.bodyUsed || this.body?.locked) throw new TypeError("Body has already been consumed.");
+    return new VallumReconstructedResponse(cloneReconstructedDocument(this.#document), this.#bodyText, {
+      status: this.status,
+      statusText: this.statusText,
+      headers: this.headers,
+    }, this);
+  }
+}
+
+function cloneReconstructedDocument(value: unknown): unknown {
+  // Container graphs follow native clone/json independence, but one-shot
+  // pixel references are intentionally shared. Cloning a Response must not
+  // duplicate protected pixels or defeat consumption and heap release.
+  if (value instanceof VallumRenderRef) return value;
+  if (Array.isArray(value)) return value.map(cloneReconstructedDocument);
+  if (!isRecord(value)) return value;
+
+  const clone: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(clone, key, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: cloneReconstructedDocument(value[key]),
+    });
+  }
+  return clone;
 }
 
 function isRenderPayload(value: unknown): value is RenderPayload {
@@ -138,6 +227,7 @@ const deferredRefKey = "$vallum_ref";
 const disclosurePath = "/__vallum/disclose";
 const disclosureBatchSize = 64;
 const maxDeferredReferences = 256;
+const responseReplayWindow = 1_024;
 
 /**
  * Returns the handle when the node is exactly `{"$vallum_ref": "<handle>"}`.
@@ -158,12 +248,15 @@ function deferredHandleOf(value: unknown): string | undefined {
  * drive unbounded work in the browser.
  */
 function collectDeferredReferences(node: unknown, out: DeferredReference[], depth = 0): void {
-  if (depth > 64 || out.length > maxDeferredReferences) return;
+  if (depth > 64) throw new Error("Vallum protected response nesting exceeds the supported limit");
   if (Array.isArray(node)) {
     for (let index = 0; index < node.length; index++) {
       const child = node[index];
       const handle = deferredHandleOf(child);
       if (handle !== undefined) {
+        if (out.length >= maxDeferredReferences) {
+          throw new Error("Vallum protected response has too many deferred values");
+        }
         out.push({ handle, assign: (value) => { node[index] = value; } });
         continue;
       }
@@ -176,6 +269,9 @@ function collectDeferredReferences(node: unknown, out: DeferredReference[], dept
     const child = node[key];
     const handle = deferredHandleOf(child);
     if (handle !== undefined) {
+      if (out.length >= maxDeferredReferences) {
+        throw new Error("Vallum protected response has too many deferred values");
+      }
       out.push({ handle, assign: (value) => { node[key] = value; } });
       continue;
     }
@@ -198,10 +294,20 @@ class BrowserVallumClient implements VallumClient {
   private readonly renewalWindowMs: number;
   private state?: DecodingState;
   private renewal?: Promise<void>;
+  private isDestroyed = false;
+  private readonly abortController = new AbortController();
+  private activeExchanges = 0;
+  private readonly idleResolvers = new Set<() => void>();
   private readonly replayByEpoch = new Map<string, { seen: Set<number>; pending: Set<number>; highest: number }>();
 
   constructor(options: VallumClientOptions) {
     if (!options.endpoint) throw new Error("Vallum endpoint is required");
+    if (typeof globalThis.fetch !== "function" && !options.fetch) {
+      throw new Error("Vallum requires a browser-compatible fetch implementation");
+    }
+    if (!globalThis.crypto?.subtle) {
+      throw new Error("Vallum requires Web Crypto in a secure browser context");
+    }
     this.endpoint = options.endpoint.replace(/\/$/, "");
     this.baseFetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.sessionPath = options.sessionPath ?? "/__vallum/session";
@@ -211,22 +317,48 @@ class BrowserVallumClient implements VallumClient {
   }
 
   async renew(): Promise<void> {
+    this.assertActive();
     if (this.renewal) return this.renewal;
-    this.renewal = this.establishSession().finally(() => {
+    this.renewal = this.establishSessionWhenIdle().finally(() => {
       this.renewal = undefined;
     });
     return this.renewal;
   }
 
   wrapFetch(implementation: typeof globalThis.fetch): typeof globalThis.fetch {
+    this.assertActive();
     return ((input: RequestInfo | URL, init?: RequestInit) => this.protectedFetch(implementation, input, init)) as typeof globalThis.fetch;
   }
 
-  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  readonly fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    this.assertActive();
     return this.protectedFetch(this.baseFetch, input, init);
+  };
+
+  get destroyed(): boolean {
+    return this.isDestroyed;
+  }
+
+  destroy(): void {
+    if (this.isDestroyed) return;
+    this.isDestroyed = true;
+    this.abortController.abort(new Error("Vallum client has been destroyed"));
+    this.state = undefined;
+    this.replayByEpoch.clear();
+    for (const resolve of this.idleResolvers) resolve();
+    this.idleResolvers.clear();
+  }
+
+  private async establishSessionWhenIdle(): Promise<void> {
+    if (this.activeExchanges > 0) {
+      await new Promise<void>((resolve) => this.idleResolvers.add(resolve));
+    }
+    this.assertActive();
+    await this.establishSession();
   }
 
   private async establishSession(): Promise<void> {
+    this.assertActive();
     const keyPair = await crypto.subtle.generateKey(
       { name: "RSA-OAEP", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
       false,
@@ -241,25 +373,33 @@ class BrowserVallumClient implements VallumClient {
     const proofPublicKey = await crypto.subtle.exportKey("jwk", proofKeyPair.publicKey);
     const challengeResponse = await this.baseFetch(new URL(this.challengePath, this.endpoint), {
       method: "POST",
+      redirect: "error",
+      signal: this.abortController.signal,
       credentials: "include",
       cache: "no-store",
       headers: { Accept: "application/json" },
     });
+    this.assertActive();
     if (!challengeResponse.ok) throw new Error(`Vallum session challenge failed (${challengeResponse.status})`);
     const challenge = (await challengeResponse.json()) as ChallengeResponse;
+    this.assertActive();
     validateChallenge(challenge);
 
     let admission = "";
     if (challenge.admission_required) {
       const admissionResponse = await this.baseFetch(new URL(this.admissionPath, this.endpoint), {
         method: "POST",
+        redirect: "error",
+        signal: this.abortController.signal,
         credentials: "include",
         cache: "no-store",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify({ public_key: publicKey, proof_key: proofPublicKey, session: challenge.session }),
       });
+      this.assertActive();
       if (!admissionResponse.ok) throw new Error(`Vallum decoding admission failed (${admissionResponse.status})`);
       const issued = (await admissionResponse.json()) as AdmissionResponse;
+      this.assertActive();
       if (!issued || typeof issued.admission !== "string" || issued.admission.length < 16) {
         throw new Error("Vallum decoding admission response is invalid");
       }
@@ -267,13 +407,17 @@ class BrowserVallumClient implements VallumClient {
     }
     const response = await this.baseFetch(new URL(this.sessionPath, this.endpoint), {
       method: "POST",
+      redirect: "error",
+      signal: this.abortController.signal,
       credentials: "include",
       cache: "no-store",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ public_key: publicKey, proof_key: proofPublicKey, admission }),
     });
+    this.assertActive();
     if (!response.ok) throw new Error(`Vallum session bootstrap failed (${response.status})`);
     const bootstrap = (await response.json()) as BootstrapResponse;
+    this.assertActive();
     validateBootstrap(bootstrap);
     const label = encoder.encode(`vallum-session-v1:${bootstrap.session}:${bootstrap.key_id}`);
     const rawKey = await crypto.subtle.decrypt(
@@ -282,39 +426,119 @@ class BrowserVallumClient implements VallumClient {
       decodeBase64URL(bootstrap.wrapped_key),
     );
     const key = await crypto.subtle.importKey("raw", rawKey, { name: "AES-GCM" }, false, ["decrypt"]);
+    this.assertActive();
     this.state = { ...bootstrap, key, proofKey: proofKeyPair.privateKey, expiresAtMs: Date.parse(bootstrap.expires_at) };
     this.replayByEpoch.set(bootstrap.key_id, { seen: new Set(), pending: new Set(), highest: 0 });
     while (this.replayByEpoch.size > 3) this.replayByEpoch.delete(this.replayByEpoch.keys().next().value!);
   }
 
   private async protectedFetch(implementation: typeof globalThis.fetch, input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    if (!this.state || Date.now() + this.renewalWindowMs >= this.state.expiresAtMs) await this.renew();
-    let responseState = this.requireState();
-    const request = await buildRequest(input, init, this.endpoint, responseState);
-    let response = await implementation(request);
-    if ((response.status === 409 || response.status === 428) && response.headers.get("X-Vallum-Proof-Required") === "1" && isSafeRetry(request.method)) {
-      await this.renew();
-      const renewed = this.requireState();
-      responseState = renewed;
-      response = await implementation(await buildRequest(input, init, this.endpoint, renewed));
+    this.assertActive();
+    let responseState = await this.acquireResponseState();
+    let ownsExchangeSlot = true;
+    let exchange: { request: Request; response: Response; dispose(): void } | undefined;
+    try {
+      exchange = await this.performSignedFetch(implementation, input, init, responseState);
+      if ((exchange.response.status === 409 || exchange.response.status === 428) && exchange.response.headers.get("X-Vallum-Proof-Required") === "1" && isSafeRetry(exchange.request.method)) {
+        exchange.dispose();
+        exchange = undefined;
+        this.releaseExchangeSlot();
+        ownsExchangeSlot = false;
+
+        await this.renew();
+        responseState = await this.acquireResponseState(true);
+        ownsExchangeSlot = true;
+        exchange = await this.performSignedFetch(implementation, input, init, responseState);
+      }
+      const reconstructed = await this.reconstructIfPresent(
+        exchange.response,
+        responseState,
+        exchange.request.signal,
+      );
+      this.assertActive();
+      return reconstructed;
+    } finally {
+      exchange?.dispose();
+      if (ownsExchangeSlot) this.releaseExchangeSlot();
     }
-    return this.reconstructIfPresent(response, responseState);
   }
 
-  private async reconstructIfPresent(response: Response, state: DecodingState): Promise<Response> {
+  /**
+   * Starts an exchange only when no key rotation is running. The synchronous
+   * increment closes the race with a concurrent explicit `renew()` call.
+   */
+  private async acquireResponseState(acceptFreshState = false): Promise<DecodingState> {
+    let refreshed = acceptFreshState;
+    while (true) {
+      this.assertActive();
+      if (this.renewal) {
+        await this.renewal;
+        refreshed = true;
+        continue;
+      }
+      if (!this.state || (!refreshed && Date.now() + this.renewalWindowMs >= this.state.expiresAtMs)) {
+        await this.renew();
+        refreshed = true;
+        continue;
+      }
+      this.activeExchanges++;
+      return this.state;
+    }
+  }
+
+  private releaseExchangeSlot(): void {
+    if (this.activeExchanges === 0) return;
+    this.activeExchanges--;
+    if (this.activeExchanges !== 0) return;
+    for (const resolve of this.idleResolvers) resolve();
+    this.idleResolvers.clear();
+  }
+
+  private async performSignedFetch(
+    implementation: typeof globalThis.fetch,
+    input: RequestInfo | URL,
+    init: RequestInit | undefined,
+    state: DecodingState,
+  ): Promise<{ request: Request; response: Response; dispose(): void }> {
+    const built = await buildRequest(input, init, this.endpoint, state);
+    this.assertActive();
+    const guarded = guardRequestSignal(built, this.abortController.signal);
+    try {
+      const response = await implementation(guarded.request);
+      this.assertActive();
+      return { request: guarded.request, response, dispose: guarded.dispose };
+    } catch (error) {
+      guarded.dispose();
+      throw error;
+    }
+  }
+
+  private async reconstructIfPresent(
+    response: Response,
+    state: DecodingState,
+    requestSignal: AbortSignal,
+  ): Promise<Response> {
     const contentType = response.headers.get("Content-Type")?.toLowerCase() ?? "";
     if (!contentType.includes("application/json") && !contentType.includes("+json")) return response;
     let transport: unknown;
     try {
       transport = JSON.parse(await response.clone().text());
     } catch {
+      assertNotAborted(requestSignal);
       return response;
     }
+    assertNotAborted(requestSignal);
+    this.assertActive();
     if (!isRecord(transport) || !Object.prototype.hasOwnProperty.call(transport, state.metadata_key)) return response;
-    return this.reconstruct(response, state, transport);
+    return this.reconstruct(response, state, transport, requestSignal);
   }
 
-  private async reconstruct(response: Response, state: DecodingState, transport: Record<string, any>): Promise<Response> {
+  private async reconstruct(
+    response: Response,
+    state: DecodingState,
+    transport: Record<string, any>,
+    requestSignal: AbortSignal,
+  ): Promise<Response> {
     const metadata = transport[state.metadata_key];
     const envelope = parseEnvelope(metadata, state.profile);
     if (envelope.version !== 1 || envelope.session !== state.session || envelope.keyID !== state.key_id) {
@@ -325,7 +549,8 @@ class BrowserVallumClient implements VallumClient {
     }
     const replay = this.replayByEpoch.get(state.key_id) ?? { seen: new Set<number>(), pending: new Set<number>(), highest: 0 };
     this.replayByEpoch.set(state.key_id, replay);
-    if (replay.seen.has(envelope.counter) || replay.pending.has(envelope.counter)) {
+    const replayFloor = replay.highest - responseReplayWindow;
+    if (envelope.counter <= replayFloor || replay.seen.has(envelope.counter) || replay.pending.has(envelope.counter)) {
       throw new Error("Vallum protected response replay detected");
     }
     replay.pending.add(envelope.counter);
@@ -349,19 +574,24 @@ class BrowserVallumClient implements VallumClient {
     } finally {
       replay.pending.delete(envelope.counter);
     }
+    assertNotAborted(requestSignal);
+    this.assertActive();
 
     // Redemption happens after integrity validation and outside its error
     // handling. A disclosure failure is an authorization or budget outcome,
     // not a tampered response, and must not be reported as one.
-    const restored = await this.restoreWithheldValues(original, state);
+    const restored = await this.restoreWithheldValues(original, state, requestSignal);
+    assertNotAborted(requestSignal);
+    this.assertActive();
     const headers = new Headers(response.headers);
     for (const name of ["Content-Length", "Content-Encoding", "X-Vallum-Transform"]) headers.delete(name);
     headers.set("Content-Type", "application/json; charset=utf-8");
-    return new Response(JSON.stringify(restored), {
+    const body = JSON.stringify(restored);
+    return new VallumReconstructedResponse(restored, body, {
       status: response.status,
       statusText: response.statusText,
       headers,
-    });
+    }, response);
   }
 
   /**
@@ -376,12 +606,16 @@ class BrowserVallumClient implements VallumClient {
    * Response is constructed, so calling code receives the exact origin object
    * and never observes a handle.
    */
-  private async restoreWithheldValues(document: unknown, state: DecodingState): Promise<unknown> {
+  private async restoreWithheldValues(
+    document: unknown,
+    state: DecodingState,
+    requestSignal: AbortSignal,
+  ): Promise<unknown> {
     // A withheld value at the document root has no parent to assign into, so
     // it is handled before the walk.
     const rootHandle = deferredHandleOf(document);
     if (rootHandle !== undefined) {
-      const rootValues = await this.redeemHandles([rootHandle], state);
+      const rootValues = await this.redeemHandles([rootHandle], state, requestSignal);
       if (!Object.prototype.hasOwnProperty.call(rootValues, rootHandle)) {
         throw new Error("Vallum could not restore a withheld value; the disclosure budget may be exhausted");
       }
@@ -392,7 +626,7 @@ class BrowserVallumClient implements VallumClient {
     if (references.length === 0) return document;
 
     const handles = [...new Set(references.map((reference) => reference.handle))];
-    const values = await this.redeemHandles(handles, state);
+    const values = await this.redeemHandles(handles, state, requestSignal);
     for (const reference of references) {
       if (!Object.prototype.hasOwnProperty.call(values, reference.handle)) {
         throw new Error("Vallum could not restore a withheld value; the disclosure budget may be exhausted");
@@ -402,35 +636,55 @@ class BrowserVallumClient implements VallumClient {
     return document;
   }
 
-  private async redeemHandles(handles: string[], state: DecodingState): Promise<Record<string, unknown>> {
+  private async redeemHandles(
+    handles: string[],
+    state: DecodingState,
+    requestSignal: AbortSignal,
+  ): Promise<Record<string, unknown>> {
     const values: Record<string, unknown> = {};
     for (let offset = 0; offset < handles.length; offset += disclosureBatchSize) {
       const batch = handles.slice(offset, offset + disclosureBatchSize);
       const request = await buildRequest(
         new URL(disclosurePath, this.endpoint),
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ handles: batch }) },
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ handles: batch }),
+          signal: requestSignal,
+        },
         this.endpoint,
         state,
       );
-      const response = await this.baseFetch(request);
-      if (response.status === 429) {
-        throw new Error("Vallum disclosure budget is exhausted for this session");
-      }
-      if (!response.ok) {
-        throw new Error(`Vallum disclosure request failed with status ${response.status}`);
-      }
-      const payload = await response.json();
-      if (!isRecord(payload) || !Array.isArray(payload.results)) {
-        throw new Error("Vallum disclosure response is malformed");
-      }
-      for (const result of payload.results) {
-        if (!isRecord(result) || typeof result.handle !== "string") continue;
-        if (typeof result.error === "string" && result.error) continue;
-        // A render-only field arrives as pixels. It is never turned into a
-        // string here, so the plaintext does not enter the JS heap.
-        values[result.handle] = isRenderPayload(result.render)
-          ? new VallumRenderRef(result.render)
-          : result.value;
+      assertNotAborted(requestSignal);
+      this.assertActive();
+      const guarded = guardRequestSignal(request, this.abortController.signal);
+      try {
+        const response = await this.baseFetch(guarded.request);
+        assertNotAborted(requestSignal);
+        this.assertActive();
+        if (response.status === 429) {
+          throw new Error("Vallum disclosure budget is exhausted for this session");
+        }
+        if (!response.ok) {
+          throw new Error(`Vallum disclosure request failed with status ${response.status}`);
+        }
+        const payload = await response.json();
+        assertNotAborted(requestSignal);
+        this.assertActive();
+        if (!isRecord(payload) || !Array.isArray(payload.results)) {
+          throw new Error("Vallum disclosure response is malformed");
+        }
+        for (const result of payload.results) {
+          if (!isRecord(result) || typeof result.handle !== "string") continue;
+          if (typeof result.error === "string" && result.error) continue;
+          // A render-only field arrives as pixels. It is never turned into a
+          // string here, so the plaintext does not enter the JS heap.
+          values[result.handle] = isRenderPayload(result.render)
+            ? new VallumRenderRef(result.render)
+            : result.value;
+        }
+      } finally {
+        guarded.dispose();
       }
     }
     return values;
@@ -441,11 +695,15 @@ class BrowserVallumClient implements VallumClient {
   }
 
   async mount(element: Element, value: unknown, options: MountOptions = {}): Promise<boolean> {
+    this.assertActive();
+    if (options.signal) assertNotAborted(options.signal);
     if (!(value instanceof VallumRenderRef)) return false;
-    const payload = value.take();
+    const payload = value[inspectRenderReference]();
     if (!payload) return false;
 
-    const bytes = Uint8Array.from(atob(payload.png.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+    // The Go renderer intentionally emits raw (unpadded) base64. Normalize it
+    // before `atob` so strict browser implementations accept every PNG size.
+    const bytes = decodeBase64URL(payload.png);
     const blob = new Blob([bytes], { type: "image/png" });
     let bitmap: ImageBitmap;
     try {
@@ -453,40 +711,55 @@ class BrowserVallumClient implements VallumClient {
     } catch (error) {
       throw new Error("Vallum could not paint a render-only value", { cause: error });
     }
+    try {
+      this.assertActive();
+      if (options.signal) assertNotAborted(options.signal);
+    } catch (error) {
+      bitmap.close();
+      throw error;
+    }
 
-    const ratio = globalThis.devicePixelRatio ?? 1;
-    const cssHeight = options.height ?? payload.height / 2;
-    const cssWidth = (payload.width / payload.height) * cssHeight;
-    const canvas = element.ownerDocument.createElement("canvas");
-    canvas.width = Math.round(cssWidth * ratio);
-    canvas.height = Math.round(cssHeight * ratio);
-    canvas.style.width = `${cssWidth}px`;
-    canvas.style.height = `${cssHeight}px`;
-    canvas.style.verticalAlign = "middle";
-    canvas.setAttribute("role", "img");
-    // Without an explicit opt-in the value stays out of the accessibility
-    // tree. That is the protection and also its accessibility cost.
-    canvas.setAttribute("aria-label", options.accessibleLabel ?? "protected value");
-    const context = canvas.getContext("2d");
-    if (!context) throw new Error("Vallum could not obtain a 2D canvas context");
-    context.imageSmoothingEnabled = true;
-    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-    bitmap.close();
+    try {
+      const ratio = globalThis.devicePixelRatio ?? 1;
+      const cssHeight = options.height ?? payload.height / 2;
+      const cssWidth = (payload.width / payload.height) * cssHeight;
+      const canvas = element.ownerDocument.createElement("canvas");
+      canvas.width = Math.round(cssWidth * ratio);
+      canvas.height = Math.round(cssHeight * ratio);
+      canvas.style.width = `${cssWidth}px`;
+      canvas.style.height = `${cssHeight}px`;
+      canvas.style.verticalAlign = "middle";
+      canvas.setAttribute("role", "img");
+      canvas.setAttribute("data-vallum-render", "");
+      canvas.setAttribute("data-vallum-source-width", String(payload.width));
+      canvas.setAttribute("data-vallum-source-height", String(payload.height));
+      // Without an explicit opt-in the value stays out of the accessibility
+      // tree. That is the protection and also its accessibility cost.
+      canvas.setAttribute("aria-label", options.accessibleLabel ?? "protected value");
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("Vallum could not obtain a 2D canvas context");
+      context.imageSmoothingEnabled = true;
+      context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
 
-    element.replaceChildren(canvas);
-    return true;
+      this.assertActive();
+      if (options.signal) assertNotAborted(options.signal);
+      if (!value[consumeRenderReference](payload)) return false;
+      element.replaceChildren(canvas);
+      return true;
+    } finally {
+      bitmap.close();
+    }
   }
 
   private commitCounter(replay: { seen: Set<number>; pending: Set<number>; highest: number }, counter: number): void {
     replay.seen.add(counter);
     replay.highest = Math.max(replay.highest, counter);
-    const floor = replay.highest - 1_024;
-    for (const seen of replay.seen) if (seen < floor) replay.seen.delete(seen);
+    const floor = replay.highest - responseReplayWindow;
+    for (const seen of replay.seen) if (seen <= floor) replay.seen.delete(seen);
   }
 
-  private requireState(): DecodingState {
-    if (!this.state) throw new Error("Vallum session is not initialized");
-    return this.state;
+  private assertActive(): void {
+    if (this.isDestroyed) throw new Error("Vallum client has been destroyed");
   }
 }
 
@@ -507,12 +780,21 @@ async function buildRequest(
   const source = input instanceof Request ? input : undefined;
   const rawURL = source?.url ?? (input instanceof URL ? input.toString() : String(input));
   const absoluteURL = new URL(rawURL, endpoint);
+  const endpointURL = new URL(endpoint);
+  if (absoluteURL.origin !== endpointURL.origin) {
+    throw new TypeError("Vallum protected requests must target the configured endpoint origin");
+  }
   const base = source ? new Request(absoluteURL, source) : new Request(absoluteURL, init);
   const request = source && init ? new Request(base, init) : base;
   const headers = new Headers(request.headers);
   headers.set(state.session_header, state.session);
   headers.set("Accept", headers.get("Accept") ?? "application/json");
-  const unsigned = new Request(request, { headers, credentials: init?.credentials ?? source?.credentials ?? "include", cache: "no-store" });
+  const unsigned = new Request(request, {
+    headers,
+    credentials: init?.credentials ?? source?.credentials ?? "include",
+    cache: "no-store",
+    redirect: "error",
+  });
   const bodyHash = await requestBodyHash(unsigned);
   const tokenID = randomTokenID();
   const claims = {
@@ -535,7 +817,52 @@ async function buildRequest(
   const signatureBytes = new Uint8Array(signature);
   if (signatureBytes.byteLength !== 64) throw new Error("Vallum request proof signature is invalid");
   headers.set(state.proof_header, `${payload}.${encodeBase64URL(signatureBytes)}`);
-  return new Request(unsigned, { headers, credentials: init?.credentials ?? source?.credentials ?? "include", cache: "no-store" });
+  return new Request(unsigned, {
+    headers,
+    credentials: init?.credentials ?? source?.credentials ?? "include",
+    cache: "no-store",
+    redirect: "error",
+  });
+}
+
+/**
+ * Couples a caller-owned request signal to the client's lifecycle without
+ * replacing either one. Listeners remain attached only while fetch or body
+ * reconstruction is in progress.
+ */
+function guardRequestSignal(request: Request, lifecycleSignal: AbortSignal): {
+  request: Request;
+  dispose(): void;
+} {
+  const controller = new AbortController();
+  const signals = request.signal === lifecycleSignal
+    ? [lifecycleSignal]
+    : [request.signal, lifecycleSignal];
+  const listeners: Array<{ signal: AbortSignal; listener: () => void }> = [];
+
+  for (const signal of signals) {
+    const abort = (): void => {
+      if (!controller.signal.aborted) controller.abort(signal.reason);
+    };
+    if (signal.aborted) {
+      abort();
+      break;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    listeners.push({ signal, listener: abort });
+  }
+
+  return {
+    request: new Request(request, { signal: controller.signal, redirect: "error" }),
+    dispose(): void {
+      for (const { signal, listener } of listeners) signal.removeEventListener("abort", listener);
+    },
+  };
+}
+
+function assertNotAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
 }
 
 async function requestBodyHash(request: Request): Promise<string> {

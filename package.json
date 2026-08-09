@@ -3,15 +3,33 @@
   "version": "0.1.0",
   "description": "Session-bound browser response reconstruction for Vallum",
   "type": "module",
-  "files": ["dist"],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vallum-proxy/vallum.git",
+    "directory": "packages/vallum-client"
+  },
+  "homepage": "https://github.com/vallum-proxy/vallum#readme",
+  "bugs": "https://github.com/vallum-proxy/vallum/issues",
+  "keywords": ["vallum", "browser", "fetch", "security", "sdk"],
+  "sideEffects": false,
+  "files": ["dist", "README.md"],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run"
-  }
+    "test": "vitest run",
+    "prepack": "npm run build && node ../../scripts/prepare-package-license.mjs .",
+    "postpack": "node ../../scripts/cleanup-package-license.mjs ."
+  },
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public", "provenance": true }
 }
