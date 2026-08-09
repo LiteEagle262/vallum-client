@@ -1,0 +1,17 @@
+{
+  "name": "@vallum/client",
+  "version": "0.1.0",
+  "description": "Session-bound browser response reconstruction for Vallum",
+  "type": "module",
+  "files": ["dist"],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  }
+}
