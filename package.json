@@ -6,11 +6,10 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vallum-proxy/vallum.git",
-    "directory": "packages/vallum-client"
+    "url": "git+https://github.com/LiteEagle262/vallum-client.git"
   },
-  "homepage": "https://github.com/vallum-proxy/vallum#readme",
-  "bugs": "https://github.com/vallum-proxy/vallum/issues",
+  "homepage": "https://github.com/LiteEagle262/vallum-client#readme",
+  "bugs": "https://github.com/LiteEagle262/vallum-client/issues",
   "keywords": ["vallum", "browser", "fetch", "security", "sdk"],
   "sideEffects": false,
   "files": ["dist", "README.md"],
