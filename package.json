@@ -1,6 +1,6 @@
 {
   "name": "@liteeagle226/client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Session-bound browser response reconstruction for Vallum",
   "type": "module",
   "license": "Apache-2.0",

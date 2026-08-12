@@ -8,6 +8,10 @@ responses, and returns an ordinary `Response` containing the origin JSON.
 npm install @liteeagle226/client
 ```
 
+The browser client also requires a trusted same-origin admission broker. Use
+`npm install @liteeagle226/admission` for a framework-neutral Node backend, or
+use `@liteeagle226/nextjs/server` in a Next.js application.
+
 ```ts
 import { createVallumClient } from "@liteeagle226/client";
 
@@ -44,4 +48,4 @@ signing key to this package or any browser bundle.
 
 First-party integrations are available for React, Next.js, Vue/Nuxt, Svelte,
 Angular, and zero-build HTML. The repository contains the
-[full protocol, deployment, render-only, and security documentation](https://github.com/vallum-proxy/vallum/tree/main/docs).
+[full protocol, deployment, render-only, and security documentation](https://github.com/LiteEagle262/vallum/tree/main/docs).
