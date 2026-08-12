@@ -1,15 +1,15 @@
-# `@vallum/client`
+# `@liteeagle226/client`
 
 Framework-agnostic browser client for Vallum. It establishes a short-lived,
 application-admitted session, signs protected requests, verifies transformed
 responses, and returns an ordinary `Response` containing the origin JSON.
 
 ```sh
-npm install @vallum/client
+npm install @liteeagle226/client
 ```
 
 ```ts
-import { createVallumClient } from "@vallum/client";
+import { createVallumClient } from "@liteeagle226/client";
 
 const vallum = await createVallumClient({
   endpoint: window.location.origin,
@@ -39,7 +39,7 @@ different origin; call the final same-origin route directly instead.
 
 Before creation, the application must establish its normal authenticated
 session. Its trusted backend must expose `POST /.well-known/vallum/admission`;
-use `@vallum/admission` or `@vallum/nextjs/server`. Never ship the admission
+use `@liteeagle226/admission` or `@liteeagle226/nextjs/server`. Never ship the admission
 signing key to this package or any browser bundle.
 
 First-party integrations are available for React, Next.js, Vue/Nuxt, Svelte,

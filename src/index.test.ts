@@ -6,7 +6,7 @@ const encoder = new TextEncoder();
 const onePixelPNG =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
-describe("@vallum/client", () => {
+describe("@liteeagle226/client", () => {
   const original = {
     database_host: "prod-db-01.internal",
     nested: { enabled: true, nullable: null, unicode: "東京 🚀" },

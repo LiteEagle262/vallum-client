@@ -1,5 +1,5 @@
 {
-  "name": "@vallum/client",
+  "name": "@liteeagle226/client",
   "version": "0.1.0",
   "description": "Session-bound browser response reconstruction for Vallum",
   "type": "module",
